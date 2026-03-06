@@ -274,7 +274,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 if  iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>200000:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
 
-                    gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
+                    gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, current_iter=iteration)
                     
                 # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
                 if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000 and opt.add_point:
@@ -308,6 +308,24 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, "fine", tb_writer, opt.iterations,timer)
+
+    # ---- Gaussian Persistence Score (GPS) ----
+    total_iters = opt.coarse_iterations + opt.iterations
+    gps = gaussians.compute_gps(total_iters)
+    print(f"\n[Metrics] Gaussian Persistence Score (GPS): {gps:.4f}")
+    if tb_writer:
+        tb_writer.add_scalar("metrics/GPS", gps, total_iters)
+    # Persist to a JSON file alongside other experiment outputs
+    import json
+    metrics_log_path = os.path.join(args.model_path, "temporal_metrics.json")
+    existing = {}
+    if os.path.exists(metrics_log_path):
+        with open(metrics_log_path, 'r') as f:
+            existing = json.load(f)
+    existing["GPS"] = gps
+    with open(metrics_log_path, 'w') as f:
+        json.dump(existing, f, indent=2)
+    print(f"[Metrics] GPS written to {metrics_log_path}")
 
 def prepare_output_and_logger(expname):    
     if not args.model_path:

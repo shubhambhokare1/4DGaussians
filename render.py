@@ -28,7 +28,7 @@ import threading
 import concurrent.futures
 from utils.render_utils import get_state_at_time
 def multithread_write(image_list, path):
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=None)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
     def write_image(image, count, path):
         try:
             torchvision.utils.save_image(image, os.path.join(path, '{0:05d}'.format(count) + ".png"))

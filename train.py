@@ -207,7 +207,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     m = torch.ones(1, image_tensor.shape[2], image_tensor.shape[3], device="cuda")
                 fg_masks.append(m)
             mask_tensor = torch.stack(fg_masks, 0)  # [B, 1, H, W]
-            Ll1 = l1_loss(image_tensor * mask_tensor, gt_image_tensor[:,:3,:,:] * mask_tensor)
+            # Foreground pixels get full weight; background gets 0.05 so background
+            # Gaussians are still penalised (preventing unconstrained growth) but
+            # the gradient budget is dominated by the foreground objects.
+            weight = mask_tensor * (1.0 - args.fg_bg_weight) + args.fg_bg_weight
+            Ll1 = (torch.abs(image_tensor - gt_image_tensor[:,:3,:,:]) * weight).mean()
         else:
             Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
 
@@ -476,6 +480,8 @@ if __name__ == "__main__":
                         help="Bounding-sphere radius for drift loss (metres)")
     parser.add_argument("--lambda_drift", type=float, default=0.05,
                         help="Weight for trajectory-guided drift loss")
+    parser.add_argument("--fg_bg_weight", type=float, default=0.05,
+                        help="Loss weight for background pixels when --fg_mask_loss is set (0=ignore bg, 1=equal weight)")
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

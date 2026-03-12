@@ -2,16 +2,29 @@
 # Run train.py → render.py → metrics.py for selected 4DGS test-dataset scenes.
 #
 # Usage:
-#   bash run_all_scenes.sh                              # all scenes, baseline
-#   bash run_all_scenes.sh --scene 1                   # scene 1 only (by number)
-#   bash run_all_scenes.sh --scene scene3_collision    # scene by full name
-#   bash run_all_scenes.sh --scene 1 --scene 3        # multiple scenes
-#   bash run_all_scenes.sh --fg_mask_loss              # all scenes, fg-mask mode
-#   bash run_all_scenes.sh --drift_loss --scale_reg    # all scenes, drift+scale mode
-#   bash run_all_scenes.sh --scene 2 --scale_reg       # scene 2, scale-reg mode
+#   bash run_all_scenes.sh                                        # all scenes, baseline
+#   bash run_all_scenes.sh --scene 1                             # scene 1 only (by number)
+#   bash run_all_scenes.sh --scene scene3_collision              # scene by full name
+#   bash run_all_scenes.sh --scene 1 --scene 3                  # multiple scenes
 #
-# Mode flags are forwarded to train.py and appended to the expname so outputs
-# from different modes coexist under separate directories.
+# Training modes (can be combined; each appends a suffix to the output dir):
+#   --fg_mask_loss                  foreground-weighted L1 loss (uses per-frame masks)
+#   --fg_bg_weight 0.05             background pixel weight for fg_mask_loss (default 0.05)
+#   --drift_loss                    trajectory-guided Gaussian anchor loss
+#   --lambda_drift 0.05             weight for drift loss (default 0.05)
+#   --drift_radius 0.6              bounding-sphere radius in metres (default 0.6)
+#   --scale_reg                     scale regularisation to suppress needle Gaussians
+#   --lambda_scale_reg 0.01         weight for scale regularisation (default 0.01)
+#
+# Examples:
+#   bash run_all_scenes.sh --fg_mask_loss                        # fg-mask mode, all scenes
+#   bash run_all_scenes.sh --fg_mask_loss --fg_bg_weight 0.01   # lower bg weight
+#   bash run_all_scenes.sh --drift_loss --scale_reg              # drift+scale mode
+#   bash run_all_scenes.sh --fg_mask_loss --drift_loss --scale_reg  # combined (best predicted)
+#   bash run_all_scenes.sh --scene 2 --drift_loss               # scene 2, drift only
+#
+# Mode flags are forwarded to train.py and appended to the expname so all
+# runs coexist under separate output directories.
 
 set -euo pipefail
 
@@ -90,9 +103,13 @@ while [[ $# -gt 0 ]]; do
             TRAIN_FLAGS="$TRAIN_FLAGS --lambda_drift $2"
             shift 2
             ;;
+        --fg_bg_weight)
+            TRAIN_FLAGS="$TRAIN_FLAGS --fg_bg_weight $2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1"
-            echo "Valid flags: --scene N|name  --all  --fg_mask_loss  --drift_loss  --scale_reg  --lambda_scale_reg F"
+            echo "Valid flags: --scene N|name  --all  --fg_mask_loss  --fg_bg_weight F  --drift_loss  --lambda_drift F  --drift_radius F  --scale_reg  --lambda_scale_reg F"
             exit 1
             ;;
     esac

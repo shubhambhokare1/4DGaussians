@@ -10,11 +10,12 @@
 # Training modes (can be combined; each appends a suffix to the output dir):
 #   --fg_mask_loss                  foreground-weighted L1 loss (uses per-frame masks)
 #   --fg_bg_weight 0.05             background pixel weight for fg_mask_loss (default 0.05)
-#   --drift_loss                    trajectory-guided Gaussian anchor loss
+#   --drift_loss                    trajectory-guided Gaussian anchor loss (shape-aware SDF)
 #   --lambda_drift 0.05             weight for drift loss (default 0.05)
-#   --drift_radius 0.6              bounding-sphere radius in metres (default 0.6)
 #   --scale_reg                     scale regularisation to suppress needle Gaussians
 #   --lambda_scale_reg 0.01         weight for scale regularisation (default 0.01)
+#
+# Logs: each stage writes to output/<expname>/logs/{train,render,metrics}.log
 #
 # Examples:
 #   bash run_all_scenes.sh --fg_mask_loss                        # fg-mask mode, all scenes
@@ -95,10 +96,6 @@ while [[ $# -gt 0 ]]; do
             TRAIN_FLAGS="$TRAIN_FLAGS --lambda_scale_reg $2"
             shift 2
             ;;
-        --drift_radius)
-            TRAIN_FLAGS="$TRAIN_FLAGS --drift_radius $2"
-            shift 2
-            ;;
         --lambda_drift)
             TRAIN_FLAGS="$TRAIN_FLAGS --lambda_drift $2"
             shift 2
@@ -109,7 +106,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Valid flags: --scene N|name  --all  --fg_mask_loss  --fg_bg_weight F  --drift_loss  --lambda_drift F  --drift_radius F  --scale_reg  --lambda_scale_reg F"
+            echo "Valid flags: --scene N|name  --all  --fg_mask_loss  --fg_bg_weight F  --drift_loss  --lambda_drift F  --scale_reg  --lambda_scale_reg F"
             exit 1
             ;;
     esac
@@ -137,29 +134,36 @@ for SCENE in "${SELECTED_SCENES[@]}"; do
     SCENE_CFG_SRC="$ARGS_SRC/${SCENE}.py"
     SCENE_CFG_DST="$ARGS_DST/${SCENE}.py"
     OUTPUT_DIR="output/$EXPNAME"
+    LOG_DIR="$OUTPUT_DIR/logs"
+
+    # Create output and log dirs before training writes there
+    mkdir -p "$LOG_DIR"
 
     # Copy the per-scene config from the dataset arguments folder
     cp "$SCENE_CFG_SRC" "$SCENE_CFG_DST"
 
     # ── Train ──────────────────────────────────────────────────────
-    echo "[train] $EXPNAME"
+    echo "[train] $EXPNAME  →  $LOG_DIR/train.log"
     python train.py \
         -s "$SCENE_DATA" \
         --port "$PORT" \
         --expname "$EXPNAME" \
         --configs "$SCENE_CFG_DST" \
-        $TRAIN_FLAGS
+        $TRAIN_FLAGS \
+        2>&1 | tee "$LOG_DIR/train.log"
 
     # ── Render ─────────────────────────────────────────────────────
-    echo "[render] $EXPNAME"
+    echo "[render] $EXPNAME  →  $LOG_DIR/render.log"
     python render.py \
         --model_path "$OUTPUT_DIR" \
-        --configs "$SCENE_CFG_DST"
+        --configs "$SCENE_CFG_DST" \
+        2>&1 | tee "$LOG_DIR/render.log"
 
     # ── Metrics ────────────────────────────────────────────────────
-    echo "[metrics] $EXPNAME"
+    echo "[metrics] $EXPNAME  →  $LOG_DIR/metrics.log"
     python metrics.py \
-        -m "$OUTPUT_DIR"
+        -m "$OUTPUT_DIR" \
+        2>&1 | tee "$LOG_DIR/metrics.log"
 
     echo "[done] $EXPNAME"
 done

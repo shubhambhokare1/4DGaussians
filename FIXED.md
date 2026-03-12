@@ -172,22 +172,78 @@ Output: `output/scene1_close_proximity_drift_scale_reg/`
 **Scale regularisation (`--scale_reg`, `--lambda_scale_reg`, default 0.01):**
 Adds `lambda_scale_reg * mean(max_scale_per_gaussian)` to the loss. Directly penalises elongated/needle Gaussians by discouraging large scale values.
 
-**Trajectory-guided drift loss (`--drift_loss`, `--lambda_drift 0.05`, `--drift_radius 0.6`):**
-Uses ground-truth object trajectories from `4dgs-test-dataset/trajectories/` to anchor Gaussians to their assigned objects.
+**Trajectory-guided drift loss (`--drift_loss`, `--lambda_drift 0.05`):**
+Uses ground-truth object trajectories from `4dgs-test-dataset/trajectories/` to anchor Gaussians to their assigned objects. Two methods were considered:
 
-Implementation:
-1. **`utils/trajectory_utils.py`** (new) — loads the per-scene trajectory class, assigns initial labels, computes drift penalty
-2. **`scene/gaussian_model.py`** — `self._object_labels` (CPU LongTensor[N]) assigned at init via proximity to t=0 centres; propagated through clone/split/prune
-3. **`train.py`** — fine stage only: `loss += lambda_drift * Σ_k mean(opacity_k * ReLU(||xyz_k - center_k(t)|| - drift_radius))`
+---
 
-Key design choices:
-- Penalty applied to canonical positions (`_xyz`), not deformed — the deformation network handles temporal movement
-- Opacity detached so gradients flow only through xyz
-- `drift_radius=0.6` default (slightly larger than actual sphere radius 0.3) to allow Gaussians to fit the surface
-- Background Gaussians (label=0) are exempt
-- Labels propagate through densification (children inherit parent label)
+#### Method A — Fixed bounding sphere (initial approach, superseded)
 
-Scenes where drift loss has clearest advantage: **scene2** (identical spheres — no colour cue for identity) and **scene3** (collision — objects momentarily overlap).
+Each foreground object is bounded by a single sphere of fixed radius `drift_radius` (default 0.6 m):
+
+```
+loss_k = mean_{i: label_i==k} [ opacity_i * ReLU(||xyz_i − c_k(t)|| − drift_radius) ]
+```
+
+**Label assignment:** at t=0, any Gaussian within `drift_radius` of an object centre gets that object's label.
+
+**Limitations:**
+- A sphere is the wrong shape for non-spherical objects. For scene 8 rods (2 m long, ~0.1 m diameter) a sphere that fits the length is 20× too wide and captures background Gaussians; a tight sphere truncates the ends.
+- The 0.6 m default was calibrated for 0.3 m radius spheres — every other scene type required manual tuning.
+- Scene 9 droplets change apparent size as they split/merge; a fixed radius is either too tight at rest or too loose when separated.
+
+---
+
+#### Method B — Shape-aware SDF bounding volumes (current implementation)
+
+Each object exposes its true bounding geometry via `trajectory.get_object_bounds(time, object_id)`, returning one of:
+
+```python
+{'type': 'sphere',  'radius': float}
+{'type': 'capsule', 'half_length': float, 'radius': float}   # axis = local X
+{'type': 'obb',     'half_extents': np.array([hx, hy, hz])}  # orientation from quaternion
+```
+
+The drift penalty uses the signed-distance function (SDF) for the appropriate shape:
+
+```
+loss_k = mean_{i: label_i==k} [ opacity_i * ReLU(SDF_k(xyz_i, t)) ]
+```
+
+SDF > 0 means outside the bounding volume; ReLU zeroes the gradient for Gaussians already inside (no unnecessary pull toward centre).
+
+**Per-object geometry:**
+
+| Scene | Object | Bound |
+|---|---|---|
+| 1–3, 5, 6, 10 | Spheres | `sphere` r=0.3 m |
+| 4 | Sphere | `sphere` r=0.3 m |
+| 4 | Wall | `obb` half-extents [0.05, 0.4, 1.0] m |
+| 7 | Sphere (deformable) | `sphere` r=0.70 m (radius + max compression slack) |
+| 7 | Cube | `obb` half-extents [0.6, 0.6, 0.6] m |
+| 8 | Both rods | `capsule` half-length=1.0 m, radius=0.06 m |
+| 9 | Droplets | `sphere` r=0.40 m (merged) → 0.28 m (fully split), time-varying |
+
+**SDF implementations (`utils/trajectory_utils.py`):**
+- `_sphere_sdf`: `||p − c|| − r`
+- `_capsule_sdf`: transform to object local frame via quaternion, clamp projection onto X-axis to ±half_length, compute distance to closest point on segment, subtract radius
+- `_obb_sdf`: transform to object local frame, apply standard box SDF (`||max(|q| − h, 0)|| + min(max(|q| − h), 0)`)
+
+**Label assignment:** same SDF at t=0 with 5 cm slack (`sdf ≤ 0.05`) replaces the fixed-radius proximity check.
+
+**Files modified:**
+1. `4dgs-test-dataset/trajectories/trajectory_base.py` — `get_object_bounds()` default (sphere r=0.35)
+2. All 10 scene trajectory files — per-object overrides
+3. `utils/trajectory_utils.py` — full SDF rewrite
+4. `scene/gaussian_model.py` — `init_object_labels()` signature (no `drift_radius` arg)
+5. `train.py` — `--drift_radius` argument removed; `compute_drift_loss` call updated
+
+**Key design choices:**
+- Penalty on canonical positions (`_xyz`), not deformed — the deformation network owns temporal motion
+- Opacity detached so gradients flow only through xyz (prevents Gaussians going transparent to escape penalty)
+- Background Gaussians (label=0) exempt; labels propagate through clone/split/prune
+
+Scenes where drift loss has clearest advantage: **scene2** (identical spheres, no colour cue), **scene3** (three-body collision, momentary overlap), **scene8** (rods require capsule — sphere would be useless).
 
 ### Combined mode (`--fg_mask_loss --drift_loss --scale_reg`)
 Predicted best overall: fg_mask removes background pressure, scale_reg kills remaining needle Gaussians, drift loss prevents object-boundary scatter.

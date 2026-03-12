@@ -173,12 +173,13 @@ class GaussianModel:
         n_init = fused_point_cloud.shape[0]
         self.gaussian_birth_iter = [0] * n_init
         self._gps_lifespans = []
-    def init_object_labels(self, trajectory, drift_radius: float, class_mapping: dict = None):
-        """Assign per-Gaussian object labels by proximity to object centres at t=0."""
+
+    def init_object_labels(self, trajectory, class_mapping: dict = None):
+        """Assign per-Gaussian object labels using per-object bounding volumes at t=0."""
         from utils.trajectory_utils import assign_initial_labels
         xyz_np = self._xyz.detach().cpu().numpy()
         self._object_labels = assign_initial_labels(
-            trajectory, xyz_np, drift_radius, class_mapping
+            trajectory, xyz_np, class_mapping
         )
         self._trajectory = trajectory
         n_fg = int((self._object_labels > 0).sum())

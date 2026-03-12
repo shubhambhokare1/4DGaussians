@@ -232,7 +232,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         if args.drift_loss and stage == "fine" and gaussians._object_labels is not None:
             from utils.trajectory_utils import compute_drift_loss
             t = viewpoint_cams[0].time
-            drift_l = compute_drift_loss(gaussians, gaussians._trajectory, t, args.drift_radius)
+            drift_l = compute_drift_loss(gaussians, gaussians._trajectory, t)
             loss += args.lambda_drift * drift_l
         # if opt.lambda_lpips !=0:
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
@@ -336,7 +336,7 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
             if os.path.exists(cm_path):
                 raw = json.load(open(cm_path))
                 class_mapping = {v: int(k) for k, v in raw.items() if k != "0"}
-            gaussians.init_object_labels(trajectory, args.drift_radius, class_mapping)
+            gaussians.init_object_labels(trajectory, class_mapping)
         except Exception as e:
             print(f"[DriftLoss] Warning: could not load trajectory for '{scene_name}': {e}")
             print("[DriftLoss] Drift loss will be skipped for this scene.")
@@ -476,8 +476,6 @@ if __name__ == "__main__":
                         help="Penalise large-scale Gaussians to reduce needle artifacts")
     parser.add_argument("--lambda_scale_reg", type=float, default=0.01,
                         help="Weight for scale regularisation loss")
-    parser.add_argument("--drift_radius", type=float, default=0.6,
-                        help="Bounding-sphere radius for drift loss (metres)")
     parser.add_argument("--lambda_drift", type=float, default=0.05,
                         help="Weight for trajectory-guided drift loss")
     parser.add_argument("--fg_bg_weight", type=float, default=0.05,

@@ -1,8 +1,6 @@
-# Environment Fixes
+# Migrated to README
 
-Commands run to fix dependency issues before training.
-
-## 1. NumPy 2.x incompatibility with PyTorch / torchvision / lpips
+All content from this file has been moved to `README.md` under "Fixes and Improvements (moved from FIXED.md)".
 
 **Error:** `_ARRAY_API not found` — torch 2.0.1 and torchvision 0.15.2 were compiled against NumPy 1.x and crash with NumPy 2.x.
 

@@ -27,11 +27,11 @@ def loadCam(args, id, cam_info, resolution_scale):
     # if resized_image_rgb.shape[1] == 4:
         # loaded_mask = resized_image_rgb[3:4, ...]
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                   image=cam_info.image, gt_alpha_mask=None,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, 
-                  time = cam_info.time,
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  time=cam_info.time, mask=cam_info.mask,
 )
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):

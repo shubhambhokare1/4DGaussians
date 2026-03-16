@@ -46,7 +46,7 @@ class GaussianModel:
 
     def __init__(self, sh_degree : int, args):
         self.active_sh_degree = 0
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)
         self._deformation = deform_network(args)
         self._features_dc = torch.empty(0)
@@ -61,6 +61,13 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self._deformation_table = torch.empty(0)
+        # GPS tracking: per-Gaussian birth iterations (CPU list) and
+        # accumulated lifespans of already-pruned Gaussians
+        self.gaussian_birth_iter = None  # list[int], len == current N
+        self._gps_lifespans = []         # list[int], lifespans of dead Gaussians
+        # Drift-loss: per-Gaussian integer object label (0=background, CPU LongTensor)
+        self._object_labels = None
+        self._trajectory = None
         self.setup_functions()
 
     def capture(self):
@@ -153,7 +160,7 @@ class GaussianModel:
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._deformation = self._deformation.to("cuda") 
+        self._deformation = self._deformation.to("cuda")
         # self.grid = self.grid.to("cuda")
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -162,6 +169,22 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
+        # GPS: all initial Gaussians are born at iteration 0
+        n_init = fused_point_cloud.shape[0]
+        self.gaussian_birth_iter = [0] * n_init
+        self._gps_lifespans = []
+
+    def init_object_labels(self, trajectory, class_mapping: dict = None):
+        """Assign per-Gaussian object labels using per-object bounding volumes at t=0."""
+        from utils.trajectory_utils import assign_initial_labels
+        xyz_np = self._xyz.detach().cpu().numpy()
+        self._object_labels = assign_initial_labels(
+            trajectory, xyz_np, class_mapping
+        )
+        self._trajectory = trajectory
+        n_fg = int((self._object_labels > 0).sum())
+        print(f"[DriftLoss] Labels assigned: {n_fg}/{len(self._object_labels)} foreground Gaussians")
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -348,8 +371,17 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-    def prune_points(self, mask):
+    def prune_points(self, mask, current_iter=None):
         valid_points_mask = ~mask
+        # GPS: record lifespans for pruned Gaussians, then filter birth list
+        if self.gaussian_birth_iter is not None:
+            birth_arr = torch.tensor(self.gaussian_birth_iter, dtype=torch.long)
+            if current_iter is not None and mask.any():
+                dead_births = birth_arr[mask.cpu()]
+                self._gps_lifespans.extend(
+                    (current_iter - dead_births).tolist()
+                )
+            self.gaussian_birth_iter = birth_arr[valid_points_mask.cpu()].tolist()
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -363,6 +395,8 @@ class GaussianModel:
         self._deformation_table = self._deformation_table[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self._object_labels is not None:
+            self._object_labels = self._object_labels[valid_points_mask.cpu()]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -387,7 +421,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table, current_iter=None, new_object_labels=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -405,14 +439,29 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         # self._deformation = optimizable_tensors["deformation"]
-        
+
         self._deformation_table = torch.cat([self._deformation_table,new_deformation_table],-1)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # GPS: record birth iteration for newly created Gaussians
+        if self.gaussian_birth_iter is not None:
+            birth_it = current_iter if current_iter is not None else 0
+            self.gaussian_birth_iter.extend([birth_it] * new_xyz.shape[0])
+        # Drift-loss: extend object labels for new Gaussians
+        if self._object_labels is not None:
+            if new_object_labels is not None:
+                self._object_labels = torch.cat(
+                    [self._object_labels, new_object_labels.cpu().long()], dim=0
+                )
+            else:
+                self._object_labels = torch.cat(
+                    [self._object_labels,
+                     torch.zeros(new_xyz.shape[0], dtype=torch.long)], dim=0
+                )
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, current_iter=None):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -435,25 +484,33 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_deformation_table = self._deformation_table[selected_pts_mask].repeat(N)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_deformation_table)
+        new_labels = (
+            self._object_labels[selected_pts_mask.cpu()].repeat(N)
+            if self._object_labels is not None else None
+        )
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_deformation_table, current_iter=current_iter, new_object_labels=new_labels)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
-        self.prune_points(prune_filter)
+        self.prune_points(prune_filter, current_iter=current_iter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent, density_threshold=20, displacement_scale=20, model_path=None, iteration=None, stage=None):
         grads_accum_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        
+
 
         selected_pts_mask = torch.logical_and(grads_accum_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        new_xyz = self._xyz[selected_pts_mask] 
+        new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_deformation_table = self._deformation_table[selected_pts_mask]
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
+        new_labels = (
+            self._object_labels[selected_pts_mask.cpu()]
+            if self._object_labels is not None else None
+        )
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table, current_iter=iteration, new_object_labels=new_labels)
 
     @property
     def get_aabb(self):
@@ -486,7 +543,7 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
         return selected_xyz, new_xyz
 
-    def prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def prune(self, max_grad, min_opacity, extent, max_screen_size, current_iter=None):
         prune_mask = (self.get_opacity < min_opacity).squeeze()
 
         if max_screen_size:
@@ -495,7 +552,7 @@ class GaussianModel:
             prune_mask = torch.logical_or(prune_mask, big_points_vs)
 
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
+        self.prune_points(prune_mask, current_iter=current_iter)
 
         torch.cuda.empty_cache()
     def densify(self, max_grad, min_opacity, extent, max_screen_size, density_threshold, displacement_scale, model_path=None, iteration=None, stage=None):
@@ -503,7 +560,7 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, extent, density_threshold, displacement_scale, model_path, iteration, stage)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_split(grads, max_grad, extent, current_iter=iteration)
     def standard_constaint(self):
         
         means3D = self._xyz.detach()
@@ -575,3 +632,15 @@ class GaussianModel:
         return total
     def compute_regulation(self, time_smoothness_weight, l1_time_planes_weight, plane_tv_weight):
         return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
+
+    def compute_gps(self, total_iters):
+        """Gaussian Persistence Score: mean normalised lifespan across all Gaussians."""
+        if total_iters <= 0 or self.gaussian_birth_iter is None:
+            return 0.0
+        birth_arr = torch.tensor(self.gaussian_birth_iter, dtype=torch.long)
+        alive_lifespans = (total_iters - birth_arr).tolist()
+        all_lifespans = self._gps_lifespans + alive_lifespans
+        if not all_lifespans:
+            return 0.0
+        gps = sum(ls / total_iters for ls in all_lifespans) / len(all_lifespans)
+        return float(gps)

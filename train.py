@@ -198,11 +198,26 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         gt_image_tensor = torch.cat(gt_images,0)
         # Loss
         # breakpoint()
-        Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
+        if args.fg_mask_loss:
+            fg_masks = []
+            for vcam in viewpoint_cams:
+                if vcam.mask is not None:
+                    m = torch.from_numpy((vcam.mask > 0).astype(np.float32)).unsqueeze(0).cuda()
+                else:
+                    m = torch.ones(1, image_tensor.shape[2], image_tensor.shape[3], device="cuda")
+                fg_masks.append(m)
+            mask_tensor = torch.stack(fg_masks, 0)  # [B, 1, H, W]
+            # Foreground pixels get full weight; background gets 0.05 so background
+            # Gaussians are still penalised (preventing unconstrained growth) but
+            # the gradient budget is dominated by the foreground objects.
+            weight = mask_tensor * (1.0 - args.fg_bg_weight) + args.fg_bg_weight
+            Ll1 = (torch.abs(image_tensor - gt_image_tensor[:,:3,:,:]) * weight).mean()
+        else:
+            Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
 
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         # norm
-        
+
 
         loss = Ll1
         if stage == "fine" and hyper.time_smoothness_weight != 0:
@@ -212,6 +227,13 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         if opt.lambda_dssim != 0:
             ssim_loss = ssim(image_tensor,gt_image_tensor)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
+        if args.scale_reg:
+            loss += args.lambda_scale_reg * gaussians.get_scaling.max(dim=1).values.mean()
+        if args.drift_loss and stage == "fine" and gaussians._object_labels is not None:
+            from utils.trajectory_utils import compute_drift_loss
+            t = viewpoint_cams[0].time
+            drift_l = compute_drift_loss(gaussians, gaussians._trajectory, t)
+            loss += args.lambda_drift * drift_l
         # if opt.lambda_lpips !=0:
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
         #     loss += opt.lambda_lpips * lpipsloss
@@ -271,10 +293,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     
                     gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5, 5, scene.model_path, iteration, stage)
-                if  iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>200000:
+                if  iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
 
-                    gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
+                    gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, current_iter=iteration)
                     
                 # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
                 if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000 and opt.add_point:
@@ -301,6 +323,24 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     dataset.model_path = args.model_path
     timer = Timer()
     scene = Scene(dataset, gaussians, load_coarse=None)
+
+    # Trajectory-guided drift loss: assign per-Gaussian object labels once at init
+    if args.drift_loss:
+        import json
+        from utils.trajectory_utils import load_trajectory
+        scene_name = os.path.basename(dataset.source_path.rstrip('/'))
+        try:
+            trajectory = load_trajectory(scene_name)
+            cm_path = os.path.join(dataset.source_path, "class_mapping.json")
+            class_mapping = {}
+            if os.path.exists(cm_path):
+                raw = json.load(open(cm_path))
+                class_mapping = {v: int(k) for k, v in raw.items() if k != "0"}
+            gaussians.init_object_labels(trajectory, class_mapping)
+        except Exception as e:
+            print(f"[DriftLoss] Warning: could not load trajectory for '{scene_name}': {e}")
+            print("[DriftLoss] Drift loss will be skipped for this scene.")
+
     timer.start()
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                              checkpoint_iterations, checkpoint, debug_from,
@@ -308,6 +348,24 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, "fine", tb_writer, opt.iterations,timer)
+
+    # ---- Gaussian Persistence Score (GPS) ----
+    total_iters = opt.coarse_iterations + opt.iterations
+    gps = gaussians.compute_gps(total_iters)
+    print(f"\n[Metrics] Gaussian Persistence Score (GPS): {gps:.4f}")
+    if tb_writer:
+        tb_writer.add_scalar("metrics/GPS", gps, total_iters)
+    # Persist to a JSON file alongside other experiment outputs
+    import json
+    metrics_log_path = os.path.join(args.model_path, "temporal_metrics.json")
+    existing = {}
+    if os.path.exists(metrics_log_path):
+        with open(metrics_log_path, 'r') as f:
+            existing = json.load(f)
+    existing["GPS"] = gps
+    with open(metrics_log_path, 'w') as f:
+        json.dump(existing, f, indent=2)
+    print(f"[Metrics] GPS written to {metrics_log_path}")
 
 def prepare_output_and_logger(expname):    
     if not args.model_path:
@@ -410,6 +468,18 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
+    parser.add_argument("--fg_mask_loss", action="store_true", default=False,
+                        help="Restrict photometric loss to foreground pixels using object masks")
+    parser.add_argument("--drift_loss", action="store_true", default=False,
+                        help="Trajectory-guided Gaussian anchor loss (stub; implemented after baseline)")
+    parser.add_argument("--scale_reg", action="store_true", default=False,
+                        help="Penalise large-scale Gaussians to reduce needle artifacts")
+    parser.add_argument("--lambda_scale_reg", type=float, default=0.01,
+                        help="Weight for scale regularisation loss")
+    parser.add_argument("--lambda_drift", type=float, default=0.05,
+                        help="Weight for trajectory-guided drift loss")
+    parser.add_argument("--fg_bg_weight", type=float, default=0.05,
+                        help="Loss weight for background pixels when --fg_mask_loss is set (0=ignore bg, 1=equal weight)")
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
